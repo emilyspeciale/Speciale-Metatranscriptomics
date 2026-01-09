@@ -1,0 +1,320 @@
+---
+title: "A Guide to Differential Expression Analysis via DESeq2"
+author: "Emily Speciale"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Set-Up
+
+DESeq2 is an R package used to analyze RNA sequencing (RNA-seq) data by normalizing the data and performing statistical tests to identify differentially expressed genes. DESeq2 requires two things to run: a matrix of raw read counts and a metadata file.
+
+Files you'll need:
+
+-   An R object containing a matrix with your raw read counts (txi_obj.rds).
+
+-   A metadata data frame that must contain a column for the sample ID and its associated condition (metadata.csv).
+
+-   An annotation data frame that contains the taxonomy and function associated to each contig (annotations.tsv).
+
+-   A lineage data frame that associated each taxa with a broad taxonomic group, which you can find within the MarFERReT software (MarFERReT.v1.taxa.csv).
+
+-   A data frame that links each Pfam ID to its description, which can be downloaded from the Pfam website (<https://www.ebi.ac.uk/interpro/entry/pfam/#table>) (pfam_descriptions.tsv).
+
+-   OPTIONAL: a mixoplankton database dataframe that condenses the information from Mitra et al. (2023) into species name, taxonomic group, and mixoplankton functional type. I have provided this file in the GitHub repository (mixoplankton_database.csv).
+
+#### Importing the raw read count matrix
+
+In this first step, you will read the raw read count matrix into R as a data frame and make appropriate edits to it. The counts data frame will have the transcript ID, also known as the contig ID, and the associated raw number of reads for each contig within each sample.
+
+```{r raw read counts}
+# The raw read counts are within the R object created from tximport. Read this into R using the saveRDS function.
+txi_obj <- readRDS("path/to/txi_obj.rds")
+
+# The raw read counts are saved as a matrix within this object. Turn the object into a data frame using the following code. 
+library(tibble)
+counts <- txi_obj$counts
+counts <- as.data.frame(counts)
+
+# For a bit of clean up, I like to get rid of / and _quant in the sample names.
+colnames(counts) <- gsub("/", "", colnames(counts))
+colnames(counts) <- gsub("_quant", "", colnames(counts))
+colnames(counts) <- gsub("-", ".", colnames(counts))
+
+# The samples will likely set up in alphabetical order, which might not be the order you want them in. If you want to change the order, replace this code with the sample order you want, for example:
+order <- c("T0.Ctl.1", "T0.Ctl.2", "T0.Ctl.3")
+counts <- counts[, order]
+
+# Finally, turn the rownames into a column for the counts dataframe.
+counts <- rownames_to_column(counts, var = "qseqid")
+
+
+```
+
+#### Importing the metadata
+
+Now, you need to import a metadata table. This is something you should make in Excel and import as a csv. It should include each sample ID (in the same order as your counts data!!) and its associated condition (for example, T0.Ctl.1, T0.Ctl.2, and T0.Ctl.3 are all listed with the condition Ctrl_T0). See my example metadata table for reference.
+
+```{r metadata}
+# Create the metadata table in excel, save as a csv, then read it into R. Replace the path file with your own. 
+metadata <- read.csv("path/to/metadata.csv")
+
+```
+
+#### Editing counts data frame for taxonomy
+
+The contigs were run through multiple annotation databases for taxonomy and function, resulting in a large annotation tsv file. However, a good amount of contigs map to non-protist taxonomies, or don't map to anything at all. You do not want to keep these contigs as they would bias the results. Additionally, you may only be interested in looking at the gene expression of one specific taxonomy group, such as diatoms or mixotrophs. Follow this code to filter your data accordingly. The MarFERReT.v1.taxa.csv file associates each taxonomic species with one of the following broad lineages: Dinophyceae, Bacillariophyta, Haptophyta, Ciliophora, Chlorophyta, Rhizaria, Ochrophyta, Amoebozoa, Eukaryota, or Opisthokonta.
+
+```{r annotating the contigs and filtering taxonomy}
+# Read in the annotation file, which should . Change the file path accordingly.
+library(readr)
+annot <- read_tsv("path/to/annotations.tsv")
+
+# Merge the counts table with the annotation file.
+counts <- left_join(counts, annot, by = "qseqid")
+
+# Filter only for counts that map to a taxonomy.
+counts_tax <- counts %>%
+  filter(!is.na(tax_id))
+
+# Import marferret lineage file I supplied you, change the file path accordingly.
+marferret_lineages <- read.csv("path/to/MarFERReT.v1.taxa.csv")
+
+# Merge the lineage file with the counts data.
+counts_tax <- counts %>%
+  left_join(marferret_lineages, by = "tax_id")
+
+counts_tax <- counts_tax %>% distinct()
+
+# Sort the lineage based on the taxonomy code.
+counts_tax <- counts_tax %>% 
+  mutate(lineage = case_when(class == '2864' ~ 'Dinophyceae',
+                             phylum == '2836' ~ 'Bacillariophyta',  
+                             phylum == '5878' ~ 'Ciliophora', 
+                             phylum == '2830' ~ 'Haptophyta',
+                             phylum == '3041' ~ 'Chlorophyta', 
+                             superkingdom__ == '543769' ~ 'Rhizaria',
+                             superkingdom___ == '2696291' ~ 'Ochrophyta',
+                             superkingdom_ == '554915' ~ 'Amoebozoa', 
+                             superkingdom_ == '33154' ~ 'Opisthokonta',
+                             superkingdom == '2759' ~ 'Eukaryota', TRUE ~ 'Other'))
+
+# Filter out Opisthokonta and Other, as these are not protist groups.
+counts_tax <- counts_tax %>%
+  filter(lineage != "Opisthokonta")
+counts_tax <- counts_tax %>%
+  filter(lineage != "Other")
+```
+
+```{r filtering for lineage group}
+# OPTIONAL: If you want to look at the differential expression of one the lineage groups, such as for Bacillariophyta (aka diatoms), filter even further.
+counts_tax <- counts_tax %>%
+  filter(lineage == "Bacillariophyta")
+```
+
+```{r filtering for mixotrophs}
+# OPTIONAL: If you want to filter for mixotrophs, you must take some extra steps. I have created a csv file that condenses information from the Mixoplankton Database by Mitra et al. (2023). Use this csv file to annotate for constitutive mixotrophs.
+
+# Read in the file I have that lists mixotrophic species.
+MPD <- read.csv("path/to/mixoplankton_database.csv")
+
+# Because we cannot be confident on a species level, we will identify phytoplankton with mixotrophic capabilities on a genus level. We also only want to deal with constitutive mixotrophs.
+# Filter the data set so only constitutive mixotrophs are left.
+library(dplyr)
+library(tidyverse)
+MPD_CM <- MPD %>%
+  filter(MFT %in% c("CM", "CM*"))
+
+# Create a new column 'Genus' that extracts the first word from 'Species_Name.
+MPD_CM <- MPD_CM %>%
+  mutate(Genus = word(Species_Name, 1))
+
+# Apply the transformation to the 'Genus' column and remove duplicates.
+mixotroph_genus <- unique(apply(MPD_CM[, "Genus", drop = FALSE], 1, function(row) paste(row, collapse = "_")))
+
+# Add a column to label if the taxonomy within the annotated counts matches a mixotroph genus.
+library(stringr)
+counts_tax <- counts_tax %>%
+  mutate(Mixotroph_Status = case_when(
+    str_detect(pr2_taxonomy, paste(mixotroph_genus, collapse = "|")) ~ 
+      str_extract(pr2_taxonomy, paste(mixotroph_genus, collapse = "|")),
+    str_detect(marferret_name, paste(mixotroph_genus, collapse = "|")) ~ 
+      str_extract(marferret_name, paste(mixotroph_genus, collapse = "|")),
+    TRUE ~ "Nonmixotroph"
+  ))
+
+# Filter counts data frame for only mixotrophs.
+counts_tax <- counts_tax %>%
+  filter(lineage != "Nonmixotroph")
+
+```
+
+#### Summing reads per gene
+
+Because we are working with a large protist community, several organisms will transcribe the same gene. This means that several contigs will annotate to the same gene, even if they are from different organisms. For differential expression analysis, I like to group reads by gene ID, so that I can understand the overall trend of that gene within my protist community/group.
+
+This is the last step to finalize our counts data frame before putting it into DESeq2!
+
+```{r summing reads by gene ID}
+# For this code, we use Pfam ID as an example for how to sum by gene ID. However, you can use other annotators, such as KEGG gene ID (KEGG_ko), KEGG pathway, etc. As for Pfam ID, each Pfam is represented by both a number ID and a short name. We will use the number Pfam ID for analysis. First, get rid of the decimal extension that is included on each Pfam ID, we don't need this.
+counts_tax$PF_number <- gsub("\\..*", "", counts_tax$pfam_id)
+
+# Sum the number of reads that map to each Pfam ID within each sample. Edit this accordingly so each sample is accounted for. 
+counts_tax_sum <- counts_tax %>%
+  group_by(PF_number) %>%
+  summarize(
+    T0.Ctl.1 = sum(`T0.Ctl.1`), 
+    T0.Ctl.2 = sum(`T0.Ctl.2`), 
+    T0.Ctl.3 = sum(`T0.Ctl.3`)
+  )
+
+# Delete any rows where the pfam name is NA.
+counts_tax_sum <- counts_tax_sum %>% filter(PF_number != "NA")
+counts_tax_sum <- counts_tax_sum[!is.na(counts_tax_sum$PF_number), ]
+
+# Finally, turn the column pfam_name into the row names.
+counts_tax_sum <- column_to_rownames(counts_tax_sum, var = "PF_number")
+    
+```
+
+### DESeq2 Analysis
+
+#### Running DESeq2
+
+Now we can finally run DESeq2 to obtain some results! The steps of DESeq2, which are all built into a function, are as follows:
+
+1)  Normalization (estimates size factors, accounts for sequencing depth differences)
+2)  Dispersion estimation (accounts for variability between replicates)
+3)  Statistical testing (gets p value based on Wald test then corrects for false discovery rate)
+
+```{r running DESeq2}
+#install.packages("DESeq2")
+library(DESeq2)
+
+# First, set up the DESeq2 data set by assigning the count data and metadata. 
+dds <- DESeqDataSetFromMatrix(countData = round(counts_tax_sum),
+                                  colData = metadata,
+                                  design = ~ conditions)
+
+# Now, run the built-in DESeq function that runs through the 3 steps above.
+dds <- DESeq(dds)
+
+```
+
+#### VST, PCA, and MA plots
+
+From DESeq2 results, there are several plots you can make. Here are a few.
+
+Variance Stabilizing Transformation (VST) is a useful tool for visualizing how gene expression differs between samples. A positive VST indicates expression of that gene in that sample is higher than the mean across all samples, while a negative VST indicates lower expression. You can visualize these VST results as a heatmap.
+
+```{r VST}
+# Use the vst function to perform a Variance Stabilizing Transformation.
+vsd <- vst(dds, blind = FALSE)
+
+# Generate a heatmap using the pheatmap library. You can input any genes you want into the heatmap, in this example, I just choose the top 50 most variable genes.
+#install.packages("pheatmap")
+library(pheatmap)
+top_var_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 50)
+pheatmap(assay(vsd)[top_var_genes, ], 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         scale = "row", 
+         show_rownames = FALSE, 
+         annotation_col = colData(dds))
+
+```
+
+The Principal Component Analysis (PCA) plot helps visualize how samples cluster together. This can be generated using the vsd matrix created from VST.
+
+```{r PCA}
+# Run the plotPCA function to see how samples cluster together.
+plotPCA(vsd, intgroup = "condition")
+
+```
+
+Another type of plot you can create is an MA plot, which plots log2FoldChange vs. mean expression levels. log2FoldChange (L2FC) is a metric that many scientists using DESeq2 use to interpret results. Simply put, to calculate log2FoldChange for a specific gene, L2FC = log2(\# normalized reads in Treatment A / \# normalized reads in Treatment B). A positive L2FC indicates the gene is upregulated in Treatment A, and a negative L2FC indicates the gene is upregulated in Treatment B. A L2FC of 1 indicates that the gene has 2x the amount of reads in Treatment A compared to Treatment B.
+
+```{r MA plot}
+# Access the results from the dds object and use that to create an MA plot, where the x-axis is mean expression and the y-axis is log2FoldChange.
+res <- results(dds)  # Extract results
+plotMA(res, main="DESeq2 MA Plot")
+
+```
+
+#### Extracting normalized counts from DESeq2
+
+Normalized counts are the direct result after Step 1 of DESeq processing. Although these values are not complete indicators of differential expression, visualizing normalized counts can be great for understanding the relative levels of a gene over time and/or between treatments. Here is how to access a data frame with the normalized counts of each gene within each sample.
+
+```{r extracting normalized counts}
+# Extract the normalized counts using a built-in function. Then turn into a data frame and turn the rownames into the column for pfam number.
+normalized_counts <- counts(dds, normalized=TRUE)
+normalized_counts <- as.data.frame(normalized_counts)
+normalized_counts <- rownames_to_column(normalized_counts, var="PF_number")
+
+# In order to get the pfam short name associated with each pfam ID, merge back with the annotation file. I will filter the annotation file first so that it only includes pfam_id and pfam_name and not all the other columns.
+annot_filt <- subset(annot, select = c(pfam_name, pfam_id))
+normalized_counts <- left_join(normalized_counts, annot_filt, by = "qseqid")
+normalized_counts <- normalized_counts %>% distinct()
+
+# OPTIONAL: if you would like to obtain the full name of each pfam ID, merge the normalized counts with the pfam description file I'll supply.
+pfam_descriptions <- read_tsv("path/to/pfam_descriptions.tsv")
+names(pfam_descriptions)[names(pfam_descriptions) == "Accession"] <- "PF_number"
+names(pfam_descriptions)[names(pfam_descriptions) == "Name"] <- "PF_description" 
+pfam_descriptions <- subset(pfam_descriptions, select=c(PF_number, PF_description))
+normalized_counts <- merge(normalized_counts, pfam_descriptions, by="PF_number", all.x=TRUE, all.y=FALSE)
+normalized_counts <- normalized_counts %>% distinct()
+
+# Save this as a csv on your computer.
+write.csv(normalized_counts, "/path/to/where/you/want/file/normalized_counts.csv")
+
+
+```
+
+#### Two-way comparisons in DESeq2
+
+If you want to compare gene expression between two treatment groups to determine which genes are truly significant/differentially expressed, use the following code. The final results file will include the following columns:
+
+1)  PF_number: Pfam ID
+2)  pfam_name: short Pfam name
+3)  PF_description: long Pfam name/description
+4)  baseMean: the average expression level of a gene across all samples (normalized)
+5)  log2FoldChange: described in the "VST, PCA, and MA plots" section
+6)  lfcSE: standard error of the log2FoldChange estimate
+7)  stat: the test statistic used in the Wald test to determine significance
+8)  pvalue: the raw p-value from the Wald test
+9)  padj: the False Discovery Rate (FDR)-adjusted p-value using the Benjamini-Hochberg correction
+
+Many scientists have different criteria for what they consider a differentially expressed gene (DEG). My criteria is a p-adj \< 0.05 and abs(log2FoldChange) \> 1.
+
+```{r two-way comparison}
+# Extract the results for the two groups you want to compare. Turn it into a data frame
+res <- results(dds, contrast = c("conditions", "Treatment1", "Treatment2"))
+res <- as.data.frame(res)
+res <- rownames_to_column(res, var = "PF_number")
+
+# Just like for the normalized counts, to get the short and long name for each pfam ID, merge with the annotation file and the description file.
+annot_filt <- subset(annot, select = c(pfam_name, pfam_id))
+normalized_counts <- left_join(normalized_counts, annot_filt, by = "qseqid")
+normalized_counts <- normalized_counts %>% distinct()
+pfam_descriptions <- read_tsv("path/to/pfam_descriptions.tsv")
+names(pfam_descriptions)[names(pfam_descriptions) == "Accession"] <- "PF_number"
+names(pfam_descriptions)[names(pfam_descriptions) == "Name"] <- "PF_description" 
+pfam_descriptions <- subset(pfam_descriptions, select=c(PF_number, PF_description))
+res <- merge(res, pfam_descriptions, by="PF_number", all.x=TRUE, all.y=FALSE)
+res <- res %>% distinct()
+
+# Save this result file as a csv on your computer.
+write.csv(res, "/path/to/where/you/want/file/res.csv")
+
+
+```
+
+### Conclusion
+
+Hopefully this is a helpful starting guide to how to analyze your gene expression results! There are a lot of resources online that go into more detail on what DESeq2 does, how to interpret results, etc. ChatGPT does a pretty good job of explaining some of these concepts and is also useful for learning how to code.
+
+If you have any questions, feel free to email me at speciale\@unc.edu. Good luck!
